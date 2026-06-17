@@ -1,0 +1,7 @@
+.env
+Caddyfile
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+uploads/
