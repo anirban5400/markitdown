@@ -148,6 +148,12 @@ INDEX_HTML = """
       opacity: 0.58;
     }
 
+    button.success {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+
     .meta {
       min-height: 24px;
       margin-top: 14px;
@@ -158,6 +164,34 @@ INDEX_HTML = """
     .error {
       color: var(--danger);
       font-weight: 700;
+    }
+
+    .toast {
+      position: fixed;
+      right: 20px;
+      bottom: 20px;
+      z-index: 10;
+      max-width: min(360px, calc(100% - 40px));
+      border: 1px solid var(--accent);
+      background: var(--accent);
+      color: #fff;
+      padding: 12px 14px;
+      font-weight: 700;
+      opacity: 0;
+      transform: translateY(8px);
+      pointer-events: none;
+      transition: opacity 140ms ease, transform 140ms ease;
+    }
+
+    .toast.show {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    .toast.error {
+      border-color: var(--danger);
+      background: var(--danger);
+      color: #fff;
     }
 
     .result-panel {
@@ -216,6 +250,12 @@ INDEX_HTML = """
         margin-top: 12px;
       }
 
+      .toast {
+        right: 12px;
+        bottom: 12px;
+        max-width: calc(100% - 24px);
+      }
+
       button,
       button.primary {
         width: 100%;
@@ -258,6 +298,8 @@ INDEX_HTML = """
     </section>
   </main>
 
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
   <script>
     const form = document.getElementById("convertForm");
     const fileInput = document.getElementById("file");
@@ -268,10 +310,21 @@ INDEX_HTML = """
     const clearButton = document.getElementById("clearButton");
     const copyButton = document.getElementById("copyButton");
     const downloadButton = document.getElementById("downloadButton");
+    const toast = document.getElementById("toast");
+    let toastTimer = null;
 
     function setMessage(text, isError = false) {
       message.textContent = text;
       message.className = isError ? "meta error" : "meta";
+    }
+
+    function showToast(text, isError = false) {
+      window.clearTimeout(toastTimer);
+      toast.textContent = text;
+      toast.className = isError ? "toast error show" : "toast show";
+      toastTimer = window.setTimeout(() => {
+        toast.className = isError ? "toast error" : "toast";
+      }, 2200);
     }
 
     function setResult(text) {
@@ -279,6 +332,34 @@ INDEX_HTML = """
       const hasText = text.length > 0;
       copyButton.disabled = !hasText;
       downloadButton.disabled = !hasText;
+      copyButton.textContent = "Copy";
+      copyButton.classList.remove("success");
+    }
+
+    async function copyMarkdown() {
+      if (!output.value) {
+        throw new Error("Nothing to copy.");
+      }
+
+      if (navigator.clipboard && window.isSecureContext) {
+        try {
+          await navigator.clipboard.writeText(output.value);
+          return;
+        } catch {
+          // Fall back to selection-based copy below.
+        }
+      }
+
+      output.focus();
+      output.select();
+      output.setSelectionRange(0, output.value.length);
+
+      if (!document.execCommand("copy")) {
+        throw new Error("Copy failed. Select the Markdown text and copy it manually.");
+      }
+
+      window.getSelection().removeAllRanges();
+      output.blur();
     }
 
     async function checkHealth() {
@@ -332,8 +413,21 @@ INDEX_HTML = """
     });
 
     copyButton.addEventListener("click", async () => {
-      await navigator.clipboard.writeText(output.value);
-      setMessage("Copied.");
+      try {
+        await copyMarkdown();
+        copyButton.textContent = "✓ Copied";
+        copyButton.classList.add("success");
+        setMessage("Copied to clipboard.");
+        showToast("Copied to clipboard");
+
+        window.setTimeout(() => {
+          copyButton.textContent = "Copy";
+          copyButton.classList.remove("success");
+        }, 1800);
+      } catch (error) {
+        setMessage(error.message, true);
+        showToast(error.message, true);
+      }
     });
 
     downloadButton.addEventListener("click", () => {
