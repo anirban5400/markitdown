@@ -1,14 +1,25 @@
+import asyncio
 import io
+import ipaddress
 import os
+import socket
+import time
+import uuid
 from pathlib import Path
+from tempfile import gettempdir
+from urllib.parse import urljoin, urlparse
 
+import httpx
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from markitdown import MarkItDown
+from pydantic import BaseModel, HttpUrl
 
 
 app = FastAPI(title="MarkItDown Web API")
 converter = MarkItDown(enable_plugins=False)
+TEMP_DOWNLOAD_DIR = Path(gettempdir()) / "markitdown-downloads"
+downloaded_files: dict[str, Path] = {}
 SUPPORTED_EXTENSIONS = {
     ".pdf",
     ".doc",
@@ -26,6 +37,15 @@ SUPPORTED_EXTENSIONS = {
     ".epub",
     ".zip",
 }
+
+
+class ConvertUrlRequest(BaseModel):
+    url: HttpUrl
+
+
+class ConvertUrlResponse(BaseModel):
+    markdown: str
+    cleanup_id: str
 
 INDEX_HTML = """
 <!doctype html>
@@ -113,7 +133,8 @@ INDEX_HTML = """
       color: var(--muted);
     }
 
-    input[type="file"] {
+    input[type="file"],
+    input[type="url"] {
       width: 100%;
       min-height: 44px;
       border: 1px solid var(--line);
@@ -125,6 +146,12 @@ INDEX_HTML = """
 
     .field {
       margin-bottom: 16px;
+    }
+
+    .divider {
+      height: 1px;
+      margin: 20px 0;
+      background: var(--line);
     }
 
     .actions,
@@ -337,16 +364,31 @@ INDEX_HTML = """
     </header>
 
     <section class="layout">
-      <form class="panel" id="convertForm">
-        <div class="field">
-          <label for="file">File</label>
-          <input id="file" name="file" type="file" accept=".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.html,.htm,.txt,.csv,.json,.xml,.epub,.zip" required>
-        </div>
+      <section class="panel">
+        <form id="convertForm">
+          <div class="field">
+            <label for="file">File</label>
+            <input id="file" name="file" type="file" accept=".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.html,.htm,.txt,.csv,.json,.xml,.epub,.zip" required>
+          </div>
 
-        <div class="actions">
-          <button class="primary" id="convertButton" type="submit">Convert</button>
-          <button id="clearButton" type="button">Clear</button>
-        </div>
+          <div class="actions">
+            <button class="primary" id="convertButton" type="submit">Convert</button>
+            <button id="clearButton" type="button">Clear</button>
+          </div>
+        </form>
+
+        <div class="divider"></div>
+
+        <form id="urlForm">
+          <div class="field">
+            <label for="pdfUrl">PDF URL</label>
+            <input id="pdfUrl" name="url" type="url" placeholder="https://example.com/file.pdf">
+          </div>
+
+          <div class="actions">
+            <button class="primary" id="urlButton" type="submit">Download & Convert</button>
+          </div>
+        </form>
 
         <div class="meta" id="message"></div>
         <div class="progress" id="progress" hidden>
@@ -358,7 +400,7 @@ INDEX_HTML = """
             <div class="progress-fill" id="progressFill"></div>
           </div>
         </div>
-      </form>
+      </section>
 
       <section class="panel result-panel">
         <div class="result-head">
@@ -378,10 +420,13 @@ INDEX_HTML = """
   <script>
     const form = document.getElementById("convertForm");
     const fileInput = document.getElementById("file");
+    const urlForm = document.getElementById("urlForm");
+    const pdfUrlInput = document.getElementById("pdfUrl");
     const output = document.getElementById("output");
     const message = document.getElementById("message");
     const health = document.getElementById("health");
     const convertButton = document.getElementById("convertButton");
+    const urlButton = document.getElementById("urlButton");
     const clearButton = document.getElementById("clearButton");
     const copyButton = document.getElementById("copyButton");
     const downloadButton = document.getElementById("downloadButton");
@@ -409,6 +454,7 @@ INDEX_HTML = """
       ".zip",
     ]);
     let toastTimer = null;
+    let currentCleanupId = null;
 
     function setMessage(text, isError = false) {
       message.textContent = text;
@@ -490,9 +536,27 @@ INDEX_HTML = """
     function parseErrorMessage(text) {
       try {
         const payload = JSON.parse(text);
-        return payload.detail || text || "Conversion failed.";
+        if (typeof payload.detail === "string") {
+          return payload.detail;
+        }
+        return text || "Conversion failed.";
       } catch {
         return text || "Conversion failed.";
+      }
+    }
+
+    async function cleanupDownloadedFile() {
+      if (!currentCleanupId) {
+        return;
+      }
+
+      const cleanupId = currentCleanupId;
+      currentCleanupId = null;
+
+      try {
+        await fetch(`/cleanup/${encodeURIComponent(cleanupId)}`, { method: "DELETE" });
+      } catch {
+        // The server also expires abandoned files, so cleanup failure should not block the UI.
       }
     }
 
@@ -578,6 +642,28 @@ INDEX_HTML = """
       }
     }
 
+    async function convertUrl(url) {
+      const response = await fetch("/convert-url", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ url }),
+      });
+
+      const text = await response.text();
+
+      if (!response.ok) {
+        throw new Error(parseErrorMessage(text));
+      }
+
+      try {
+        return JSON.parse(text);
+      } catch {
+        throw new Error("URL conversion returned an invalid response.");
+      }
+    }
+
     fileInput.addEventListener("change", () => {
       if (!fileInput.files.length) {
         return;
@@ -608,11 +694,13 @@ INDEX_HTML = """
       }
 
       convertButton.disabled = true;
+      urlButton.disabled = true;
       setMessage("Preparing upload...");
       setResult("");
       setProgress(`Uploading 0 B / ${formatBytes(file.size)}`, 0);
 
       try {
+        await cleanupDownloadedFile();
         const text = await convertFile(file);
         setResult(text);
         setProgress("Processing complete.", 100);
@@ -621,14 +709,51 @@ INDEX_HTML = """
         setMessage(error.message, true);
       } finally {
         convertButton.disabled = false;
+        urlButton.disabled = false;
       }
     });
 
-    clearButton.addEventListener("click", () => {
+    urlForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+
+      const url = pdfUrlInput.value.trim();
+
+      if (!url) {
+        setMessage("Paste a direct PDF URL first.", true);
+        return;
+      }
+
+      convertButton.disabled = true;
+      urlButton.disabled = true;
+      setMessage("Downloading PDF...");
+      setResult("");
+      setProgress("Downloading PDF...", null);
+
+      try {
+        await cleanupDownloadedFile();
+        const result = await convertUrl(url);
+        currentCleanupId = result.cleanup_id;
+        setResult(result.markdown || "");
+        setProgress("Processing complete.", 100);
+        setMessage("Conversion complete.");
+      } catch (error) {
+        setMessage(error.message, true);
+        resetProgress();
+      } finally {
+        convertButton.disabled = false;
+        urlButton.disabled = false;
+      }
+    });
+
+    clearButton.addEventListener("click", async () => {
+      clearButton.disabled = true;
+      await cleanupDownloadedFile();
       fileInput.value = "";
+      pdfUrlInput.value = "";
       setResult("");
       setMessage("");
       resetProgress();
+      clearButton.disabled = false;
     });
 
     copyButton.addEventListener("click", async () => {
@@ -680,6 +805,160 @@ def max_upload_bytes() -> int:
     return max_mb * 1024 * 1024
 
 
+def temp_file_ttl_seconds() -> int:
+    return int(os.getenv("TEMP_FILE_TTL_SECONDS", "1800"))
+
+
+def ensure_temp_download_dir() -> None:
+    TEMP_DOWNLOAD_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+
+def is_public_host(hostname: str) -> bool:
+    try:
+        infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Could not resolve the PDF URL host.",
+        ) from None
+
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            return False
+
+    return True
+
+
+async def validate_public_pdf_url(url: str) -> None:
+    parsed = urlparse(url)
+
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Paste a valid HTTP or HTTPS PDF URL.",
+        )
+
+    is_public = await asyncio.to_thread(is_public_host, parsed.hostname)
+    if not is_public:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="PDF URL host must be publicly reachable.",
+        )
+
+
+def looks_like_pdf_url(url: str) -> bool:
+    return urlparse(url).path.lower().endswith(".pdf")
+
+
+def looks_like_pdf_response(response: httpx.Response) -> bool:
+    content_type = response.headers.get("content-type", "").lower()
+    return "application/pdf" in content_type or looks_like_pdf_url(str(response.url))
+
+
+def delete_downloaded_file(cleanup_id: str) -> None:
+    path = downloaded_files.pop(cleanup_id, None)
+    if path and path.exists():
+        path.unlink(missing_ok=True)
+
+
+async def delete_after_ttl(cleanup_id: str, created_at: float) -> None:
+    await asyncio.sleep(temp_file_ttl_seconds())
+    path = downloaded_files.get(cleanup_id)
+    if path and time.time() >= created_at + temp_file_ttl_seconds():
+        delete_downloaded_file(cleanup_id)
+
+
+async def download_pdf(url: str, cleanup_id: str) -> Path:
+    ensure_temp_download_dir()
+    target = TEMP_DOWNLOAD_DIR / f"{cleanup_id}.pdf"
+    limit = max_upload_bytes()
+    written = 0
+
+    timeout = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
+    current_url = url
+
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=False,
+            timeout=timeout,
+            headers={"User-Agent": "MarkItDown-Web-API/1.0"},
+        ) as client:
+            for _ in range(6):
+                await validate_public_pdf_url(current_url)
+
+                async with client.stream("GET", current_url) as response:
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="PDF URL returned a redirect without a target.",
+                            )
+                        current_url = urljoin(str(response.url), location)
+                        continue
+
+                    if response.status_code >= 400:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"PDF download failed with HTTP {response.status_code}.",
+                        )
+
+                    if not looks_like_pdf_response(response):
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="URL did not return a PDF response.",
+                        )
+
+                    content_length = response.headers.get("content-length")
+                    if content_length and int(content_length) > limit:
+                        raise HTTPException(
+                            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                            detail=f"Downloaded PDF exceeds {limit} bytes",
+                        )
+
+                    with target.open("wb") as handle:
+                        async for chunk in response.aiter_bytes(1024 * 1024):
+                            written += len(chunk)
+                            if written > limit:
+                                raise HTTPException(
+                                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                                    detail=f"Downloaded PDF exceeds {limit} bytes",
+                                )
+                            handle.write(chunk)
+                    break
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="PDF URL redirected too many times.",
+                )
+    except HTTPException:
+        target.unlink(missing_ok=True)
+        raise
+    except httpx.RequestError as exc:
+        target.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Could not download PDF: {exc.__class__.__name__}",
+        ) from exc
+
+    if written == 0:
+        target.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Downloaded PDF was empty.",
+        )
+
+    return target
+
+
 @app.get("/", response_class=HTMLResponse)
 def root() -> str:
     return INDEX_HTML
@@ -726,3 +1005,33 @@ async def convert(
     buffer.seek(0)
     result = converter.convert_stream(buffer, file_extension=suffix or None)
     return result.text_content
+
+
+@app.post("/convert-url", response_model=ConvertUrlResponse)
+async def convert_url(payload: ConvertUrlRequest) -> ConvertUrlResponse:
+    url = str(payload.url)
+    cleanup_id = uuid.uuid4().hex
+    created_at = time.time()
+    path: Path | None = None
+
+    await validate_public_pdf_url(url)
+
+    try:
+        path = await download_pdf(url, cleanup_id)
+
+        with path.open("rb") as buffer:
+            result = converter.convert_stream(buffer, file_extension=".pdf")
+
+        downloaded_files[cleanup_id] = path
+        asyncio.create_task(delete_after_ttl(cleanup_id, created_at))
+        return ConvertUrlResponse(markdown=result.text_content, cleanup_id=cleanup_id)
+    except Exception:
+        if path:
+            path.unlink(missing_ok=True)
+        raise
+
+
+@app.delete("/cleanup/{cleanup_id}")
+def cleanup(cleanup_id: str) -> dict[str, bool]:
+    delete_downloaded_file(cleanup_id)
+    return {"deleted": True}
